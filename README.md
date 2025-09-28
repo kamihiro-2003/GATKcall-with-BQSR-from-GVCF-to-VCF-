@@ -20,8 +20,25 @@ COMBINE GVCFを用いるのではなく、GenomicsDBimportを用いて容量の�
 
 >[!NOTE]
 依存関係は --dependency=afterok:<配列ジョブID> で管理。ワーカーが1つでも失敗すると結合ジョブは走りません。
+## 2. ジョブヘッダー（ランチャー）
+```bash
+#!/usr/bin/env bash
+#SBATCH -J joint_genotype
+#SBATCH -p epyc
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=1G
+#SBATCH -t 0-00:30:00
+#SBATCH -o joint_launch_%j.out
+#SBATCH -e joint_launch_%j.err
+# ↑ これは“ランチャー”のリソース。実処理は子ジョブ側で指定します。
+set -euo pipefail
+```
+このスクリプトはランチャー（親ジョブ）として動き、ここでは軽量リソースでOK。
 
-## 2. 主要パラメータ（環境変数で上書き可）
+set -euo pipefail でエラーや未定義変数を即検知して安全に停止。
+
+実際の重い処理（GATK等）は子ジョブ側でリソースを指定して実行します。
+## 3. 主要パラメータ（環境変数で上書き可）
 ```bash
 # 参照・入力
 genome=201123_Psic.polished.scaffold.masked.10k
@@ -65,66 +82,151 @@ OUT_ROOT 下から *.g.vcf.gz を探索して SAMPLEMAP（sample名 ↔ gVCFパ�
 
 ## 3. ランチャーの動き
 ### 3.1 事前チェック & 作業ディレクトリ
-
+```bash
+ref_fasta="${REF_DIR}/${genome}.fa"
+[[ -f "${ref_fasta}" ]] || { echo "[ERR] ref not found: ${ref_fasta}" >&2; exit 2; }
+[[ -f "${CHR_LIST}"  ]] || { echo "[ERR] chr_list not found: ${CHR_LIST}" >&2; exit 2; }
+```
 参照FASTAと染色体リストの存在確認
-
+```bash
+mkdir -p "${RUN_DIR}"/{gendb,vcf,logs}
+echo "[OK] RUN_DIR=${RUN_DIR}"
+```
 RUN_DIR に gendb/ vcf/ logs/ を作成
 
 ### 3.2 SAMPLEMAP の生成
 
 OUT_ROOT 配下の *.g.vcf.gz を探索
-
+```bash
+if [[ -n "${SAMPLEMAP:-}" && -s "${SAMPLEMAP}" ]]; then
+  echo "[INFO] use existing SAMPLEMAP: ${SAMPLEMAP}"
+else
+  SAMPLEMAP="${RUN_DIR}/samplemap.txt"
+  : > "${SAMPLEMAP}"
+  # gVCF探索（<sample>.g.vcf.gz を想定）
+  mapfile -t GVCFS < <(find "${OUT_ROOT}" -type f -name "*.g.vcf.gz" | sort)
+  [[ "${#GVCFS[@]}" -gt 0 ]] || { echo "[ERR] gVCF not found under ${OUT_ROOT}" >&2; exit 3; }
+  for g in "${GVCFS[@]}"; do
+    bn="$(basename "$g")"; sample="${bn%%.g.vcf.gz}"
+    printf "%s\t%s\n" "${sample}" "$(readlink -f "$g")" >> "${SAMPLEMAP}"
+  done
+  echo "[OK] SAMPLEMAP generated: ${SAMPLEMAP} (n=${#GVCFS[@]})"
+fi
 ファイル名から <sample> を切り出し、<sample>\t<絶対パス> の形式で samplemap.txt を作成
+```
+OUT_ROOT 以下の *.g.vcf.gz を全探索し、<sample>\t<絶対パス> 形式で SAMPLEMAP を生成。
 
+既に自前の SAMPLEMAP があれば SAMPLEMAP=/abs/path を渡せばそれを使用。
 >[!TIP]
 既にマップがある場合は SAMPLEMAP=/abs/path/to/samplemap.txt を環境変数で渡すとそちらを使用します。
 
 ### 3.3 ワーカー（配列ジョブ）の投入
 ```bash
-N=$(grep -Ev '^\s*$|^\s*#' "${CHR_LIST}" | wc -l)
-sbatch --array=1-"$N"%${ARRAY_MAXPAR} \
-  -J joint_chr -p ${PARTITION_W} --cpus-per-task=${CPUS_W} --mem=${MEM_W} -t ${TIME_W} ...
-```
+N=$(grep -Ev '^\s*$|^\s*#' "${CHR_LIST}" | wc -l | tr -d ' ')
+echo "[INFO] chromosomes: ${N}"
 
+jid_array=$(
+  sbatch --parsable \
+    --array=1-"${N}"%"${ARRAY_MAXPAR}" \
+    -J joint_chr \
+    -p "${PARTITION_W}" \
+    --cpus-per-task="${CPUS_W}" \
+    --mem="${MEM_W}" \
+    -t "${TIME_W}" \
+    -o "${RUN_DIR}/logs/%x_%A_%a.out" \
+    -e "${RUN_DIR}/logs/%x_%A_%a.err" \
+    --export=ALL,MODE=worker,RUN_DIR="${RUN_DIR}",SAMPLEMAP="${SAMPLEMAP}",CHR_LIST="${CHR_LIST}",REF_DIR="${REF_DIR}",genome="${genome}",GATK_SIF="${GATK_SIF}",SINGULARITY_BIND="${SINGULARITY_BIND}",TMPDIR_ROOT="${TMPDIR_ROOT}",BATCH_SIZE="${BATCH_SIZE}",READER_THREADS="${READER_THREADS}",BCFTOOLS="${BCFTOOLS}" \
+    "$0"
+)
+echo "[SUBMIT] worker array JID=${jid_array}"
+```
+染色体数 N を数え、配列ジョブで 1..N の ID を割り当て。
+%${ARRAY_MAXPAR} で同時実行本数の上限を制御。
+
+ワーカーは MODE=worker を環境変数で受け、この同じスクリプトを再実行します。
 インデックスは 1 始まり（sed -n "${SLURM_ARRAY_TASK_ID}p" で行を取るため）
 
 各タスクは 1 染色体を担当、ログは RUN_DIR/logs/joint_chr_<ジョブID>_<配列ID>.*
 
 ### 3.4 全完了後に結合ジョブを依存投入
 ```bash
-sbatch --dependency=afterok:<配列ジョブID> -J joint_concat ...
+sbatch \
+  --dependency=afterok:${jid_array} \
+  -J joint_concat \
+  -p "${PARTITION_C}" \
+  --cpus-per-task="${CPUS_C}" \
+  --mem="${MEM_C}" \
+  -t "${TIME_C}" \
+  -o "${RUN_DIR}/logs/%x_%j.out" \
+  -e "${RUN_DIR}/logs/%x_%j.err" \
+  --export=ALL,MODE=concat,RUN_DIR="${RUN_DIR}",CHR_LIST="${CHR_LIST}",BCFTOOLS="${BCFTOOLS}" \
+  "$0"
+
+echo "[INFO] submitted. monitor: squeue -u $USER | egrep 'joint_chr|joint_concat'"
+exit 0
 ```
+ワーカー配列ジョブが**全て成功（afterok）**した場合のみ、結合ジョブを起動。
+
+ランチャーはここで終了。以降は子ジョブのロジックへ（下記）。
 ## 4. ワーカーの処理（MODE=worker）
 ```bash
-# 染色体名の取得
-CHROM="$(sed -n "${SLURM_ARRAY_TASK_ID}p" "${CHR_LIST}")"
+if [[ "${MODE:-}" == "worker" ]]; then
+  set -euo pipefail
+  : "${RUN_DIR:?}"; : "${SAMPLEMAP:?}"; : "${CHR_LIST:?}"; : "${REF_DIR:?}"; : "${genome:?}"
+  : "${GATK_SIF:?}"; : "${SINGULARITY_BIND:?}"; : "${TMPDIR_ROOT:?}"
+  : "${BATCH_SIZE:?}"; : "${READER_THREADS:?}"
 
-# 出力先の決定
+  CHROM="$(sed -n "${SLURM_ARRAY_TASK_ID}p" "${CHR_LIST}" | sed 's/[[:space:]]*$//')"
+  [[ -n "${CHROM}" ]] || { echo "[ERR] empty chrom for task ${SLURM_ARRAY_TASK_ID}"; exit 10; }
 
-DBPATH="RUN_DIR/gendb/${CHROM}_db"
+  DBPATH="${RUN_DIR}/gendb/${CHROM}_db"
+  VCF_OUT="${RUN_DIR}/vcf/${CHROM}.vcf.gz"
+  mkdir -p "$(dirname "${DBPATH}")" "$(dirname "${VCF_OUT}")"
 
-VCF_OUT="RUN_DIR/vcf/${CHROM}.vcf.gz"
+  # 既出力があればスキップ（再実行安全）
+  if [[ -s "${VCF_OUT}" ]]; then
+    echo "[SKIP] ${CHROM}: ${VCF_OUT} exists"
+    exit 0
+  fi
 
-# 再実行安全
-VCF_OUT が既にあれば SKIP して即終了。
+  ############################
+  # GenomicsDBImport（染色体ごと）
+  ############################
+  echo "[INFO] ${CHROM}: GenomicsDBImport"
+  ${GATK_CMD} GenomicsDBImport \
+    --sample-name-map "${SAMPLEMAP}" \
+    -L "${CHROM}" \
+    --genomicsdb-workspace-path "${DBPATH}" \
+    --batch-size "${BATCH_SIZE}" \
+    --reader-threads "${READER_THREADS}" \
+    --tmp-dir "${TMPDIR_ROOT}"
 
-# GenomicsDBImport（染色体ごと）
+  ############################
+  # GenotypeGVCFs（染色体ごと）
+  ############################
+  echo "[INFO] ${CHROM}: GenotypeGVCFs"
+  ${GATK_CMD} GenotypeGVCFs \
+    -R "${REF_DIR}/${genome}.fa" \
+    -V "gendb://${DBPATH}" \
+    -L "${CHROM}" \
+    --tmp-dir "${TMPDIR_ROOT}" \
+    -O "${VCF_OUT}"
 
-gatk GenomicsDBImport \
-  --sample-name-map ${SAMPLEMAP} -L ${CHROM} \
-  --genomicsdb-workspace-path ${DBPATH} \
-  --batch-size ${BATCH_SIZE} --reader-threads ${READER_THREADS} \
-  --tmp-dir ${TMPDIR_ROOT}
-
-
-# GenotypeGVCFs（染色体ごと）
-
-gatk GenotypeGVCFs \
-  -R ${REF_DIR}/${genome}.fa -V gendb://${DBPATH} -L ${CHROM} \
-  --tmp-dir ${TMPDIR_ROOT} -O ${VCF_OUT}
-tabix -p vcf ${VCF_OUT} || true
+  tabix -p vcf "${VCF_OUT}" || true
+  echo "[DONE] ${CHROM} -> ${VCF_OUT}"
+  exit 0
+fi
 ```
+SLURM_ARRAY_TASK_ID 行目から染色体名を取得（1始まりに注意）。
 
+出力VCFが既に存在する場合はスキップ（再実行安全）。
+
+GenomicsDBImport：SAMPLEMAP（サンプル↔gVCF）を読み、指定染色体のワークスペースを作成。
+--reader-threads は I/O 並列の主スイッチ。
+
+GenotypeGVCFs： gendb:// を入力にジェノタイプ化し、染色体別 VCF を出力。
+
+tabix で VCF を index（失敗しても致命的ではないので || true）。
 >[!WARNING]
 既存の gendb/${CHROM}_db が残っている状態で再実行すると Import でエラーになる場合があります。
 完全な再実行時は該当 gendb/ を消すか、完成済み VCF を残して Import をスキップするロジックを追加する運用も検討ください。
@@ -134,9 +236,40 @@ tabix -p vcf ${VCF_OUT} || true
 染色体ごとの vcf/<chr>.vcf.gz を全て列挙 (vcf_list.txt)
 無い染色体があれば エラー終了
 ```bash
-bcftools concat -f vcf_list.txt -O z -o cohort.raw.vcf.gz
-tabix -p vcf cohort.raw.vcf.gz
+if [[ "${MODE:-}" == "concat" ]]; then
+  set -euo pipefail
+  : "${RUN_DIR:?}"; : "${CHR_LIST:?}"; : "${BCFTOOLS:?}"
+
+  ############################
+  #  VCF リスト作成
+  ############################
+  LIST_FILE="${RUN_DIR}/vcf_list.txt"; : > "${LIST_FILE}"
+  missing=0
+  while read -r c; do
+    [[ -n "${c}" ]] || continue
+    f="${RUN_DIR}/vcf/${c}.vcf.gz"
+    if [[ -s "${f}" ]]; then
+      echo "${f}" >> "${LIST_FILE}"
+    else
+      echo "[ERR] missing VCF: ${f}" >&2
+      missing=1
+    fi
+  done < "${CHR_LIST}"
+  [[ "${missing}" -eq 0 ]] || { echo "[ERR] 欠損VCFあり。結合中止。"; exit 20; }
+
+  ############################
+  #  結合 → index
+  ############################
+  ${BCFTOOLS} concat -f "${LIST_FILE}" -O z -o "${RUN_DIR}/cohort.raw.vcf.gz"`
+  tabix -p vcf "${RUN_DIR}/cohort.raw.vcf.gz" || true
+  echo "[DONE] concat -> ${RUN_DIR}/cohort.raw.vcf.gz"
+  exit 0
+fi
 ```
+染色体リスト順に vcf/<chr>.vcf.gz を列挙し、欠損があれば停止。
+
+bcftools concat で連結（非オーバーラップな contig の分割を前提）。
+これは merge ではありません。同一サンプル集合の連結です。
 >[!TIP]
 結合は 連結（concat） であり merge ではありません。同一サンプル集合・非オーバーラップの contig 分割を前提にしています。
 
